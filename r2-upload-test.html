@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Multi-File Chunked Upload to R2</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+    }
+    .file-container {
+      margin-bottom: 20px;
+    }
+    .progressBarContainer {
+      width: 100%;
+      background-color: #eee;
+      border-radius: 5px;
+      margin-top: 5px;
+    }
+    .progressBar {
+      height: 20px;
+      background-color: #4caf50;
+      text-align: center;
+      color: white;
+      border-radius: 5px;
+      width: 0%;
+    }
+  </style>
+</head>
+<body>
+  <h2>Upload Large Files to R2 (Chunked)</h2>
+  <input type="file" id="fileInput" multiple />
+  <button onclick="handleFiles()">Upload All</button>
+  <div id="uploadsContainer"></div>
+
+  <script>
+    const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+
+    function createProgressElement(filename) {
+      const container = document.createElement("div");
+      container.className = "file-container";
+
+      const label = document.createElement("p");
+      label.textContent = `Uploading: ${filename}`;
+
+      const progressBarContainer = document.createElement("div");
+      progressBarContainer.className = "progressBarContainer";
+
+      const progressBar = document.createElement("div");
+      progressBar.className = "progressBar";
+      progressBar.textContent = "0%";
+
+      progressBarContainer.appendChild(progressBar);
+      container.appendChild(label);
+      container.appendChild(progressBarContainer);
+
+      document.getElementById("uploadsContainer").appendChild(container);
+      return progressBar;
+    }
+
+    async function retryChunkUpload(url, chunk, retries = 3) {
+      for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+          const res = await fetch(url, {
+            method: "PUT",
+            body: chunk
+          });
+
+          if (res.ok) {
+            return res.headers.get("ETag");
+          } else {
+            throw new Error("Failed to upload chunk (HTTP " + res.status + ")");
+          }
+        } catch (err) {
+          if (attempt === retries) {
+            throw err;
+          }
+          await new Promise(r => setTimeout(r, 1000 * attempt)); // exponential backoff
+          console.warn(`Retrying chunk (attempt ${attempt}):`, err.message);
+        }
+      }
+    }
+
+    async function uploadFile(file, progressBar) {
+      try {
+        const initRes = await fetch("/initiate-upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename: file.name, contentType: file.type })
+        });
+
+        const { uploadId, key } = await initRes.json();
+        const parts = [];
+        const totalParts = Math.ceil(file.size / CHUNK_SIZE);
+        let uploaded = 0;
+
+        for (let partNumber = 1; partNumber <= totalParts; partNumber++) {
+          const start = (partNumber - 1) * CHUNK_SIZE;
+          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const chunk = file.slice(start, end);
+
+          const presignRes = await fetch("/get-part-url", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ uploadId, partNumber, key })
+          });
+
+          const { url } = await presignRes.json();
+
+          const etag = await retryChunkUpload(url, chunk); // 💡 Retry logic applied
+          parts.push({ PartNumber: partNumber, ETag: etag });
+
+          uploaded += chunk.size;
+          const percent = Math.round((uploaded / file.size) * 100);
+          progressBar.style.width = percent + "%";
+          progressBar.textContent = percent + "%";
+        }
+
+        await fetch("/complete-upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ uploadId, key, parts })
+        });
+
+        progressBar.style.backgroundColor = "green";
+        progressBar.textContent = "✅ Done";
+      } catch (err) {
+        progressBar.style.backgroundColor = "red";
+        progressBar.textContent = "❌ Failed";
+        console.error("Upload error:", err);
+      }
+    }
+
+    async function handleFiles() {
+      const fileInput = document.getElementById("fileInput");
+      const files = fileInput.files;
+
+      for (const file of files) {
+        const progressBar = createProgressElement(file.name);
+        await uploadFile(file, progressBar);
+      }
+    }
+  </script>
+</body>
+</html>
